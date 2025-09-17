@@ -1,0 +1,6 @@
+/bfc
+/build/
+*.bc
+/.trigger-tree/
+/.serena/
+__pycache__/
