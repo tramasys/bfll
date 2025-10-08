@@ -1,10 +1,4 @@
-/* bfll is a handwritten brainfuck compiler */
-
 source_filename = "bfll"
-
-/* ============================================================================
-   types and constants
-   ============================================================================ */
 
 /* op fields are kind, reserved, a, b, low excursion, high excursion
    op_add = 1       a is a nonzero delta modulo 256
@@ -42,10 +36,6 @@ source_filename = "bfll"
 @mode.read = private constant [3 x i8] c"rb\00"
 @option.no.opt = private constant [12 x i8] c"--no-bf-opt\00"
 
-/* ============================================================================
-   runtime declarations
-   ============================================================================ */
-
 @stdout = external global ptr
 @stderr = external global ptr
 
@@ -61,10 +51,6 @@ declare i32 @fprintf(ptr, ptr, ...)
 declare i32 @strcmp(ptr, ptr)
 declare void @exit(i32) noreturn
 declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)
-
-/* ============================================================================
-   vector helpers
-   ============================================================================ */
 
 /* callers never retain element pointers across a push into the same vector */
 define internal void @vector.reserve(ptr %vector, i64 %element.size) {
@@ -190,10 +176,6 @@ entry:
   call void @exit(i32 1)
   unreachable
 }
-
-/* ============================================================================
-   parser
-   ============================================================================ */
 
 /* the vector has no zero add or move and no adjacent add or move operations
    check records preserve failing excursions even when the net move is zero
@@ -342,9 +324,71 @@ done:
   ret void
 }
 
-/* ============================================================================
-   main
-   ============================================================================ */
+/* successful matching gives every bracket a partner in both directions */
+define internal void @match.brackets(ptr %operations) {
+entry:
+  %length = call i64 @vector.length(ptr %operations)
+  %stack.length.ptr = getelementptr %Vector, ptr @stack, i64 0, i32 1
+  store i64 0, ptr %stack.length.ptr, align 8
+  br label %bracket.walk
+
+bracket.walk:
+  %index = phi i64 [ 0, %entry ], [ %next.index, %bracket.next ]
+  %done = icmp eq i64 %index, %length
+  br i1 %done, label %bracket.finish, label %bracket.inspect
+
+bracket.inspect:
+  %op.ptr = call ptr @op.at(ptr %operations, i64 %index)
+  %op = load %Op, ptr %op.ptr, align 8
+  %kind = extractvalue %Op %op, 0
+  switch i32 %kind, label %bracket.next [
+    i32 5, label %bracket.push
+    i32 6, label %bracket.pop
+  ]
+
+bracket.push:
+  %slot = call ptr @vector.push.slot(ptr @stack, i64 8)
+  store i64 %index, ptr %slot, align 8
+  br label %bracket.next
+
+bracket.pop:
+  %depth = load i64, ptr %stack.length.ptr, align 8
+  %empty = icmp eq i64 %depth, 0
+  br i1 %empty, label %unmatched.close, label %bracket.pair
+
+bracket.pair:
+  %next.depth = sub i64 %depth, 1
+  store i64 %next.depth, ptr %stack.length.ptr, align 8
+  %stack.data = load ptr, ptr @stack, align 8
+  %top.ptr = getelementptr i64, ptr %stack.data, i64 %next.depth
+  %opening = load i64, ptr %top.ptr, align 8
+  %open.ptr = call ptr @op.at(ptr %operations, i64 %opening)
+  %open.match = getelementptr %Op, ptr %open.ptr, i64 0, i32 2
+  %close.match = getelementptr %Op, ptr %op.ptr, i64 0, i32 2
+  store i64 %index, ptr %open.match, align 8
+  store i64 %opening, ptr %close.match, align 8
+  br label %bracket.next
+
+bracket.next:
+  %next.index = add i64 %index, 1
+  br label %bracket.walk
+
+bracket.finish:
+  %remaining = load i64, ptr %stack.length.ptr, align 8
+  %balanced = icmp eq i64 %remaining, 0
+  br i1 %balanced, label %valid, label %unmatched.open
+
+unmatched.close:
+  call void @die(ptr @err.close.bracket)
+  unreachable
+
+unmatched.open:
+  call void @die(ptr @err.open.bracket)
+  unreachable
+
+valid:
+  ret void
+}
 
 define i32 @main(i32 %argc, ptr %argv) {
 entry:
@@ -369,6 +413,7 @@ open.failed:
 compile:
   store ptr %file, ptr @input.file, align 8
   call void @parse(ptr %file)
+  call void @match.brackets(ptr @parsed)
   call void @cleanup()
   ret i32 0
 }
