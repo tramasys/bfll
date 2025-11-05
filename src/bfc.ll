@@ -391,6 +391,115 @@ valid:
   ret void
 }
 
+/* use recorded partners rather than searching a loop body */
+define internal i64 @loop.partner(ptr %operations, i64 %index) {
+entry:
+  %op.ptr = call ptr @op.at(ptr %operations, i64 %index)
+  %op = load %Op, ptr %op.ptr, align 8
+  %kind = extractvalue %Op %op, 0
+  %partner = extractvalue %Op %op, 2
+  %other.ptr = call ptr @op.at(ptr %operations, i64 %partner)
+  %other = load %Op, ptr %other.ptr, align 8
+  %other.kind = extractvalue %Op %other, 0
+  %backlink = extractvalue %Op %other, 2
+  %is.open = icmp eq i32 %kind, 5
+  %is.close = icmp eq i32 %kind, 6
+  %is.loop = or i1 %is.open, %is.close
+  %expected = select i1 %is.open, i32 6, i32 5
+  %kind.valid = icmp eq i32 %other.kind, %expected
+  %link.valid = icmp eq i64 %backlink, %index
+  %forward = icmp ugt i64 %partner, %index
+  %backward = icmp ult i64 %partner, %index
+  %direction.valid = select i1 %is.open, i1 %forward, i1 %backward
+  %valid.pair = and i1 %kind.valid, %link.valid
+  %valid.direction = and i1 %is.loop, %direction.valid
+  %valid = and i1 %valid.pair, %valid.direction
+  br i1 %valid, label %done, label %malformed
+
+malformed:
+  call void @die(ptr @err.ir)
+  unreachable
+
+done:
+  ret i64 %partner
+}
+
+define internal i1 @try.simple.loop(i64 %opening, i64 %closing) {
+entry:
+  %body.index = add i64 %opening, 1
+  %after.single = add i64 %body.index, 1
+  %single = icmp eq i64 %after.single, %closing
+  br i1 %single, label %inspect, label %reject
+
+inspect:
+  %body.ptr = call ptr @op.at(ptr @parsed, i64 %body.index)
+  %body = load %Op, ptr %body.ptr, align 8
+  %kind = extractvalue %Op %body, 0
+  %delta = extractvalue %Op %body, 2
+  %low = extractvalue %Op %body, 4
+  %high = extractvalue %Op %body, 5
+  switch i32 %kind, label %reject [
+    i32 1, label %clear.test
+    i32 2, label %scan.accept
+  ]
+
+clear.test:
+  /* precisely the odd deltas are invertible modulo 256 */
+  %odd.bit = and i64 %delta, 1
+  %odd = icmp ne i64 %odd.bit, 0
+  br i1 %odd, label %clear.accept, label %reject
+
+clear.accept:
+  %clear.index = call i64 @op.push(ptr @optimized, i32 7, i64 0, i64 0, i64 0, i64 0)
+  ret i1 true
+
+scan.accept:
+  %scan.index = call i64 @op.push(ptr @optimized, i32 8, i64 %delta, i64 0, i64 %low, i64 %high)
+  ret i1 true
+
+reject:
+  ret i1 false
+}
+
+/* a flat walk enters preserved bodies naturally without using the call stack
+   accepted loops skip their entire range and a final stack pass patches copies */
+define internal void @optimize() {
+entry:
+  %length = call i64 @vector.length(ptr @parsed)
+  br label %optimize.walk
+
+optimize.walk:
+  %index = phi i64 [ 0, %entry ], [ %next.index, %copy ], [ %after.loop, %accepted ]
+  %done = icmp eq i64 %index, %length
+  br i1 %done, label %optimize.finish, label %inspect
+
+inspect:
+  %op.ptr = call ptr @op.at(ptr @parsed, i64 %index)
+  %op = load %Op, ptr %op.ptr, align 8
+  %kind = extractvalue %Op %op, 0
+  %is.open = icmp eq i32 %kind, 5
+  br i1 %is.open, label %analyze, label %copy
+
+analyze:
+  %closing = call i64 @loop.partner(ptr @parsed, i64 %index)
+  %simple = call i1 @try.simple.loop(i64 %index, i64 %closing)
+  br i1 %simple, label %accepted, label %copy
+
+accepted:
+  %after.loop = add i64 %closing, 1
+  br label %optimize.walk
+
+copy:
+  %slot = call ptr @vector.push.slot(ptr @optimized, i64 40)
+  store %Op %op, ptr %slot, align 8
+  %next.index = add i64 %index, 1
+  br label %optimize.walk
+
+optimize.finish:
+  call void @match.brackets(ptr @optimized)
+  ret void
+}
+
 @format.i64 = private constant [5 x i8] c"%lld\00"
 
 @ir.header = private constant [1367 x i8] c"source_filename = \22brainfuck\22
@@ -686,6 +795,43 @@ entry:
   ret void
 }
 
+@ir.clear = private constant [37 x i8] c"  store i8 0, ptr %cell.$i, align 1
+\00"
+
+@ir.scan = private constant [672 x i8] c"  br label %bf.scan.$i.cond
+
+bf.scan.$i.cond:
+  %scan.index.$i = load i64, ptr %data_index, align 8
+  %scan.cell.$i = getelementptr i8, ptr %tape, i64 %scan.index.$i
+  %scan.value.$i = load i8, ptr %scan.cell.$i, align 1
+  %scan.nonzero.$i = icmp ne i8 %scan.value.$i, 0
+  br i1 %scan.nonzero.$i, label %bf.scan.$i.move, label %bf.scan.$i.end
+
+bf.scan.$i.move:
+  %scan.valid.$i = call i1 @bf.valid(i64 %scan.index.$i, i64 $b, i64 $c)
+  br i1 %scan.valid.$i, label %bf.scan.$i.checked, label %bf.bounds.error
+
+bf.scan.$i.checked:
+  %scan.next.$i = add i64 %scan.index.$i, $a
+  store i64 %scan.next.$i, ptr %data_index, align 8
+  br label %bf.scan.$i.cond
+
+bf.scan.$i.end:
+\00"
+
+define internal void @emit.clear(i64 %id) {
+entry:
+  call void @emit.address(i64 %id)
+  call void @emit(ptr @ir.clear, i64 %id, i64 0, i64 0, i64 0)
+  ret void
+}
+
+define internal void @emit.scan(i64 %id, i64 %stride, i64 %low, i64 %high) {
+entry:
+  call void @emit(ptr @ir.scan, i64 %id, i64 %stride, i64 %low, i64 %high)
+  ret void
+}
+
 /* operation indices are stable label ids and each emitter leaves an open block
    the next control edge or footer terminates that block */
 define internal void @codegen(ptr %operations) {
@@ -713,6 +859,8 @@ codegen.op:
     i32 4, label %codegen.output
     i32 5, label %codegen.open
     i32 6, label %codegen.close
+    i32 7, label %codegen.clear
+    i32 8, label %codegen.scan
     i32 10, label %codegen.move
   ]
 
@@ -738,6 +886,14 @@ codegen.open:
 
 codegen.close:
   call void @emit.loop.end(i64 %a)
+  br label %codegen.next
+
+codegen.clear:
+  call void @emit.clear(i64 %index)
+  br label %codegen.next
+
+codegen.scan:
+  call void @emit.scan(i64 %index, i64 %a, i64 %low, i64 %high)
   br label %codegen.next
 
 codegen.next:
@@ -768,15 +924,33 @@ complete:
 
 define i32 @main(i32 %argc, ptr %argv) {
 entry:
-  %valid.args = icmp eq i32 %argc, 2
-  br i1 %valid.args, label %open, label %usage
+  switch i32 %argc, label %usage [
+    i32 2, label %default.options
+    i32 3, label %parse.option
+  ]
+
+default.options:
+  %first.ptr = getelementptr ptr, ptr %argv, i64 1
+  %first = load ptr, ptr %first.ptr, align 8
+  %lone.option = call i32 @strcmp(ptr %first, ptr @option.no.opt)
+  %missing.filename = icmp eq i32 %lone.option, 0
+  br i1 %missing.filename, label %usage, label %open
+
+parse.option:
+  %option.ptr = getelementptr ptr, ptr %argv, i64 1
+  %option = load ptr, ptr %option.ptr, align 8
+  %comparison = call i32 @strcmp(ptr %option, ptr @option.no.opt)
+  %recognized = icmp eq i32 %comparison, 0
+  br i1 %recognized, label %open, label %usage
 
 usage:
   call void @die(ptr @err.usage)
   unreachable
 
 open:
-  %filename.ptr = getelementptr ptr, ptr %argv, i64 1
+  %filename.index = phi i64 [ 1, %default.options ], [ 2, %parse.option ]
+  %bf.opt = phi i1 [ true, %default.options ], [ false, %parse.option ]
+  %filename.ptr = getelementptr ptr, ptr %argv, i64 %filename.index
   %filename = load ptr, ptr %filename.ptr, align 8
   %file = call ptr @fopen(ptr %filename, ptr @mode.read)
   %missing = icmp eq ptr %file, null
@@ -790,7 +964,25 @@ compile:
   store ptr %file, ptr @input.file, align 8
   call void @parse(ptr %file)
   call void @match.brackets(ptr @parsed)
-  call void @codegen(ptr @parsed)
+  %close.status = call i32 @fclose(ptr %file)
+  store ptr null, ptr @input.file, align 8
+  %close.failed = icmp ne i32 %close.status, 0
+  br i1 %close.failed, label %read.failed, label %choose.optimization
+
+read.failed:
+  call void @die(ptr @err.read)
+  unreachable
+
+choose.optimization:
+  br i1 %bf.opt, label %optimize, label %generate
+
+optimize:
+  call void @optimize()
+  br label %generate
+
+generate:
+  %operations = phi ptr [ @parsed, %choose.optimization ], [ @optimized, %optimize ]
+  call void @codegen(ptr %operations)
   call void @cleanup()
   ret i32 0
 }
