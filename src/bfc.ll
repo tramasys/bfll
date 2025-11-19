@@ -461,6 +461,228 @@ reject:
   ret i1 false
 }
 
+/* small loop bodies justify linear lookup in a reusable coefficient vector */
+define internal void @coefficient.add(i64 %offset, i64 %delta) {
+entry:
+  %length = call i64 @vector.length(ptr @coefficients)
+  %data = load ptr, ptr @coefficients, align 8
+  br label %coefficient.search
+
+coefficient.search:
+  %index = phi i64 [ 0, %entry ], [ %next.index, %coefficient.next ]
+  %done = icmp eq i64 %index, %length
+  br i1 %done, label %coefficient.append, label %coefficient.inspect
+
+coefficient.inspect:
+  %term.ptr = getelementptr %LinearTerm, ptr %data, i64 %index
+  %stored.offset = load i64, ptr %term.ptr, align 8
+  %found = icmp eq i64 %stored.offset, %offset
+  br i1 %found, label %coefficient.update, label %coefficient.next
+
+coefficient.next:
+  %next.index = add i64 %index, 1
+  br label %coefficient.search
+
+coefficient.update:
+  %value.ptr = getelementptr %LinearTerm, ptr %term.ptr, i64 0, i32 1
+  %old = load i64, ptr %value.ptr, align 8
+  %sum = add i64 %old, %delta
+  %wrapped = and i64 %sum, 255
+  store i64 %wrapped, ptr %value.ptr, align 8
+  ret void
+
+coefficient.append:
+  call void @term.push(ptr @coefficients, i64 %offset, i64 %delta)
+  ret void
+}
+
+define internal void @term.push(ptr %vector, i64 %offset, i64 %factor) {
+entry:
+  %slot = call ptr @vector.push.slot(ptr %vector, i64 16)
+  %with.offset = insertvalue %LinearTerm zeroinitializer, i64 %offset, 0
+  %term = insertvalue %LinearTerm %with.offset, i64 %factor, 1
+  store %LinearTerm %term, ptr %slot, align 8
+  ret void
+}
+
+define internal i64 @coefficient.get(i64 %offset) {
+entry:
+  %length = call i64 @vector.length(ptr @coefficients)
+  %data = load ptr, ptr @coefficients, align 8
+  br label %search
+
+search:
+  %index = phi i64 [ 0, %entry ], [ %next.index, %next ]
+  %done = icmp eq i64 %index, %length
+  br i1 %done, label %absent, label %inspect
+
+inspect:
+  %term.ptr = getelementptr %LinearTerm, ptr %data, i64 %index
+  %term = load %LinearTerm, ptr %term.ptr, align 8
+  %stored.offset = extractvalue %LinearTerm %term, 0
+  %found = icmp eq i64 %stored.offset, %offset
+  br i1 %found, label %present, label %next
+
+next:
+  %next.index = add i64 %index, 1
+  br label %search
+
+present:
+  %coefficient = extractvalue %LinearTerm %term, 1
+  ret i64 %coefficient
+
+absent:
+  ret i64 0
+}
+
+/* extended euclid tracks the coefficient of delta in each remainder */
+define internal i64 @inverse256(i64 %delta) {
+entry:
+  br label %euclid.loop
+
+euclid.loop:
+  %old.remainder = phi i64 [ 256, %entry ], [ %remainder, %euclid.step ]
+  %remainder = phi i64 [ %delta, %entry ], [ %next.remainder, %euclid.step ]
+  %old.coefficient = phi i64 [ 0, %entry ], [ %coefficient, %euclid.step ]
+  %coefficient = phi i64 [ 1, %entry ], [ %next.coefficient, %euclid.step ]
+  %done = icmp eq i64 %remainder, 0
+  br i1 %done, label %euclid.finish, label %euclid.step
+
+euclid.step:
+  %quotient = sdiv i64 %old.remainder, %remainder
+  %remainder.product = mul i64 %quotient, %remainder
+  %next.remainder = sub i64 %old.remainder, %remainder.product
+  %coefficient.product = mul i64 %quotient, %coefficient
+  %next.coefficient = sub i64 %old.coefficient, %coefficient.product
+  br label %euclid.loop
+
+euclid.finish:
+  %invertible = icmp eq i64 %old.remainder, 1
+  br i1 %invertible, label %normalize, label %malformed
+
+normalize:
+  %inverse = and i64 %old.coefficient, 255
+  ret i64 %inverse
+
+malformed:
+  call void @die(ptr @err.ir)
+  unreachable
+}
+
+/* relative position starts and ends at zero and all coefficients wrap to bytes
+   only add and move bodies qualify and the source coefficient must be odd
+   check is the bounds metadata left by a cancelled move */
+define internal i1 @try.linear.loop(i64 %opening, i64 %closing) {
+entry:
+  %scratch.length = getelementptr %Vector, ptr @coefficients, i64 0, i32 1
+  store i64 0, ptr %scratch.length, align 8
+  %body.start = add i64 %opening, 1
+  br label %linear.walk
+
+linear.walk:
+  %index = phi i64 [ %body.start, %entry ], [ %next.index, %linear.next ]
+  %relative.ptr = phi i64 [ 0, %entry ], [ %next.relative, %linear.next ]
+  %low = phi i64 [ 0, %entry ], [ %next.low, %linear.next ]
+  %high = phi i64 [ 0, %entry ], [ %next.high, %linear.next ]
+  %done = icmp eq i64 %index, %closing
+  br i1 %done, label %linear.test, label %linear.inspect
+
+linear.inspect:
+  %op.ptr = call ptr @op.at(ptr @parsed, i64 %index)
+  %op = load %Op, ptr %op.ptr, align 8
+  %kind = extractvalue %Op %op, 0
+  %delta = extractvalue %Op %op, 2
+  switch i32 %kind, label %linear.reject [
+    i32 1, label %linear.add
+    i32 2, label %linear.move
+    i32 10, label %linear.move
+  ]
+
+linear.add:
+  call void @coefficient.add(i64 %relative.ptr, i64 %delta)
+  br label %linear.next
+
+linear.move:
+  %run.low = extractvalue %Op %op, 4
+  %run.high = extractvalue %Op %op, 5
+  %move.sum = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %relative.ptr, i64 %delta)
+  %low.sum = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %relative.ptr, i64 %run.low)
+  %high.sum = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %relative.ptr, i64 %run.high)
+  %moved = extractvalue { i64, i1 } %move.sum, 0
+  %moved.low = extractvalue { i64, i1 } %low.sum, 0
+  %moved.high = extractvalue { i64, i1 } %high.sum, 0
+  %move.overflow = extractvalue { i64, i1 } %move.sum, 1
+  %low.overflow = extractvalue { i64, i1 } %low.sum, 1
+  %high.overflow = extractvalue { i64, i1 } %high.sum, 1
+  %extrema.overflow = or i1 %low.overflow, %high.overflow
+  %overflow = or i1 %extrema.overflow, %move.overflow
+  br i1 %overflow, label %linear.reject, label %linear.move.safe
+
+linear.move.safe:
+  %lower = icmp slt i64 %moved.low, %low
+  %higher = icmp sgt i64 %moved.high, %high
+  %merged.low = select i1 %lower, i64 %moved.low, i64 %low
+  %merged.high = select i1 %higher, i64 %moved.high, i64 %high
+  br label %linear.next
+
+linear.next:
+  %next.relative = phi i64 [ %relative.ptr, %linear.add ], [ %moved, %linear.move.safe ]
+  %next.low = phi i64 [ %low, %linear.add ], [ %merged.low, %linear.move.safe ]
+  %next.high = phi i64 [ %high, %linear.add ], [ %merged.high, %linear.move.safe ]
+  %next.index = add i64 %index, 1
+  br label %linear.walk
+
+linear.test:
+  %returns = icmp eq i64 %relative.ptr, 0
+  %source.delta = call i64 @coefficient.get(i64 0)
+  %odd.bit = and i64 %source.delta, 1
+  %odd = icmp eq i64 %odd.bit, 1
+  %eligible = and i1 %returns, %odd
+  br i1 %eligible, label %linear.accept, label %linear.reject
+
+linear.accept:
+  %inverse = call i64 @inverse256(i64 %source.delta)
+  %negative.inverse = sub i64 0, %inverse
+  %first.term = call i64 @vector.length(ptr @terms)
+  %coefficient.count = call i64 @vector.length(ptr @coefficients)
+  %coefficient.data = load ptr, ptr @coefficients, align 8
+  br label %linear.terms
+
+linear.terms:
+  %term.index = phi i64 [ 0, %linear.accept ], [ %next.term, %linear.term.next ]
+  %terms.done = icmp eq i64 %term.index, %coefficient.count
+  br i1 %terms.done, label %linear.finish, label %linear.term.inspect
+
+linear.term.inspect:
+  %term.ptr = getelementptr %LinearTerm, ptr %coefficient.data, i64 %term.index
+  %term = load %LinearTerm, ptr %term.ptr, align 8
+  %offset = extractvalue %LinearTerm %term, 0
+  %coefficient = extractvalue %LinearTerm %term, 1
+  %product = mul i64 %negative.inverse, %coefficient
+  %factor = and i64 %product, 255
+  %source = icmp eq i64 %offset, 0
+  %cancelled = icmp eq i64 %factor, 0
+  %omit = or i1 %source, %cancelled
+  br i1 %omit, label %linear.term.next, label %linear.term.append
+
+linear.term.append:
+  call void @term.push(ptr @terms, i64 %offset, i64 %factor)
+  br label %linear.term.next
+
+linear.term.next:
+  %next.term = add i64 %term.index, 1
+  br label %linear.terms
+
+linear.finish:
+  %arena.length = call i64 @vector.length(ptr @terms)
+  %term.count = sub i64 %arena.length, %first.term
+  %linear.index = call i64 @op.push(ptr @optimized, i32 9, i64 %first.term, i64 %term.count, i64 %low, i64 %high)
+  ret i1 true
+
+linear.reject:
+  ret i1 false
+}
+
 /* a flat walk enters preserved bodies naturally without using the call stack
    accepted loops skip their entire range and a final stack pass patches copies */
 define internal void @optimize() {
@@ -483,7 +705,11 @@ inspect:
 analyze:
   %closing = call i64 @loop.partner(ptr @parsed, i64 %index)
   %simple = call i1 @try.simple.loop(i64 %index, i64 %closing)
-  br i1 %simple, label %accepted, label %copy
+  br i1 %simple, label %accepted, label %analyze.linear
+
+analyze.linear:
+  %linear = call i1 @try.linear.loop(i64 %index, i64 %closing)
+  br i1 %linear, label %accepted, label %copy
 
 accepted:
   %after.loop = add i64 %closing, 1
@@ -832,6 +1058,84 @@ entry:
   ret void
 }
 
+@ir.linear.begin = private constant [315 x i8] c"  %linear.nonzero.$i = icmp ne i8 %value.$i, 0
+  br i1 %linear.nonzero.$i, label %bf.linear.$i.check, label %bf.linear.$i.end
+
+bf.linear.$i.check:
+  %linear.valid.$i = call i1 @bf.valid(i64 %index.$i, i64 $a, i64 $b)
+  br i1 %linear.valid.$i, label %bf.linear.$i.apply, label %bf.bounds.error
+
+bf.linear.$i.apply:
+\00"
+
+@ir.linear.term = private constant [363 x i8] c"  %linear.index.$i.$b = add i64 %index.$i, $a
+  %linear.cell.$i.$b = getelementptr i8, ptr %tape, i64 %linear.index.$i.$b
+  %linear.old.$i.$b = load i8, ptr %linear.cell.$i.$b, align 1
+  %linear.scaled.$i.$b = mul i8 %value.$i, $c
+  %linear.sum.$i.$b = add i8 %linear.old.$i.$b, %linear.scaled.$i.$b
+  store i8 %linear.sum.$i.$b, ptr %linear.cell.$i.$b, align 1
+\00"
+
+@ir.linear.end = private constant [85 x i8] c"  store i8 0, ptr %cell.$i, align 1
+  br label %bf.linear.$i.end
+
+bf.linear.$i.end:
+\00"
+
+/* every term uses the original source and offset zero is excluded
+   the excursion check proves every target address valid before any transfer
+   a zero source skips both checks and transfers just as the original loop did */
+define internal void @emit.linear(i64 %id, i64 %first, i64 %count, i64 %low, i64 %high) {
+entry:
+  %arena.length = call i64 @vector.length(ptr @terms)
+  %first.valid = icmp ule i64 %first, %arena.length
+  %remaining = sub i64 %arena.length, %first
+  %count.valid = icmp ule i64 %count, %remaining
+  %range.valid = and i1 %first.valid, %count.valid
+  br i1 %range.valid, label %linear.begin, label %malformed
+
+linear.begin:
+  call void @emit.load(i64 %id)
+  call void @emit(ptr @ir.linear.begin, i64 %id, i64 %low, i64 %high, i64 0)
+  %data = load ptr, ptr @terms, align 8
+  %end = add i64 %first, %count
+  br label %linear.walk
+
+linear.walk:
+  %index = phi i64 [ %first, %linear.begin ], [ %next.index, %linear.emit ]
+  %done = icmp eq i64 %index, %end
+  br i1 %done, label %linear.finish, label %linear.inspect
+
+linear.inspect:
+  %term.ptr = getelementptr %LinearTerm, ptr %data, i64 %index
+  %term = load %LinearTerm, ptr %term.ptr, align 8
+  %offset = extractvalue %LinearTerm %term, 0
+  %factor = extractvalue %LinearTerm %term, 1
+  %not.source = icmp ne i64 %offset, 0
+  %above.low = icmp sge i64 %offset, %low
+  %below.high = icmp sle i64 %offset, %high
+  %in.envelope = and i1 %above.low, %below.high
+  %offset.valid = and i1 %not.source, %in.envelope
+  %factor.nonzero = icmp ne i64 %factor, 0
+  %factor.byte = icmp ule i64 %factor, 255
+  %factor.valid = and i1 %factor.nonzero, %factor.byte
+  %term.valid = and i1 %offset.valid, %factor.valid
+  br i1 %term.valid, label %linear.emit, label %malformed
+
+linear.emit:
+  call void @emit(ptr @ir.linear.term, i64 %id, i64 %offset, i64 %index, i64 %factor)
+  %next.index = add i64 %index, 1
+  br label %linear.walk
+
+linear.finish:
+  call void @emit(ptr @ir.linear.end, i64 %id, i64 0, i64 0, i64 0)
+  ret void
+
+malformed:
+  call void @die(ptr @err.ir)
+  unreachable
+}
+
 /* operation indices are stable label ids and each emitter leaves an open block
    the next control edge or footer terminates that block */
 define internal void @codegen(ptr %operations) {
@@ -850,6 +1154,7 @@ codegen.op:
   %op = load %Op, ptr %op.ptr, align 8
   %kind = extractvalue %Op %op, 0
   %a = extractvalue %Op %op, 2
+  %b = extractvalue %Op %op, 3
   %low = extractvalue %Op %op, 4
   %high = extractvalue %Op %op, 5
   switch i32 %kind, label %malformed [
@@ -861,6 +1166,7 @@ codegen.op:
     i32 6, label %codegen.close
     i32 7, label %codegen.clear
     i32 8, label %codegen.scan
+    i32 9, label %codegen.linear
     i32 10, label %codegen.move
   ]
 
@@ -894,6 +1200,10 @@ codegen.clear:
 
 codegen.scan:
   call void @emit.scan(i64 %index, i64 %a, i64 %low, i64 %high)
+  br label %codegen.next
+
+codegen.linear:
+  call void @emit.linear(i64 %index, i64 %a, i64 %b, i64 %low, i64 %high)
   br label %codegen.next
 
 codegen.next:
