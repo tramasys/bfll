@@ -979,6 +979,7 @@ entry:
   ret void
 }
 
+/* low <= delta <= high makes the checked sum safe */
 define internal void @emit.move(i64 %id, i64 %delta, i64 %low, i64 %high) {
 entry:
   call void @emit(ptr @ir.move.check, i64 %id, i64 %low, i64 %high, i64 0)
